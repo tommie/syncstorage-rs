@@ -49,4 +49,6 @@ curl -sS --request POST \
   --header 'Content-Type: application/json' \
   --data "{\"createStatement\":\"CREATE DATABASE \`$DATABASE_ID\`\",\"extraStatements\":$DDL_STATEMENTS}"
 
+touch /tmp/prepared-spanner
+
 sleep infinity
