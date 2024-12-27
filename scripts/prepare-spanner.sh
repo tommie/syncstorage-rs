@@ -18,8 +18,6 @@
 # This file contains modifications of the original version.
 #
 
-sleep 5
-
 set -e
 
 PROJECT_ID=test-project
@@ -32,7 +30,12 @@ DDL_STATEMENTS=$(
   | tr -d '\n' \
   | sed 's/\(.*\);/\1/' \
   | jq -R -s -c 'split(";")'
-) 
+)
+
+while ! curl -sS "$SYNC_SYNCSTORAGE__SPANNER_EMULATOR_HOST/v1/projects/$PROJECT_ID/instances";
+do
+    sleep 1
+done
 
 curl -sS --request POST \
   "$SYNC_SYNCSTORAGE__SPANNER_EMULATOR_HOST/v1/projects/$PROJECT_ID/instances" \
