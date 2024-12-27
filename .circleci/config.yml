@@ -107,7 +107,7 @@ commands:
       - run:
           name: e2e tests (syncstorage mysql)
           command: >
-               /usr/local/bin/docker-compose
+               docker compose
                -f docker-compose.mysql.yaml
                -f docker-compose.e2e.mysql.yaml
                up
@@ -133,7 +133,7 @@ commands:
       - run:
           name: e2e tests (syncstorage spanner)
           command: >
-               /usr/local/bin/docker-compose
+               docker compose
                -f docker-compose.spanner.yaml
                -f docker-compose.e2e.spanner.yaml
                up
@@ -285,7 +285,7 @@ jobs:
 
   mysql-e2e-tests:
     docker:
-      - image: docker/compose:1.24.0
+      - image: cimg/rust:1.78.0  # RUST_VER
         auth:
           username: $DOCKER_USER
           password: $DOCKER_PASS
@@ -304,7 +304,7 @@ jobs:
 
   spanner-e2e-tests:
     docker:
-      - image: docker/compose:1.24.0
+      - image: cimg/rust:1.78.0  # RUST_VER
         auth:
           username: $DOCKER_USER
           password: $DOCKER_PASS
@@ -323,7 +323,7 @@ jobs:
 
   deploy:
     docker:
-      - image: docker:18.02.0-ce
+      - image: cimg/rust:1.78.0  # RUST_VER
         auth:
           username: $DOCKER_USER
           password: $DOCKER_PASS
@@ -362,7 +362,7 @@ jobs:
 
   deploy-python-utils:
     docker:
-      - image: docker:stable-git
+      - image: cimg/rust:1.78.0  # RUST_VER
         auth:
           username: $DOCKER_USER
           password: $DOCKER_PASS
