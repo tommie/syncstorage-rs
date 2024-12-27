@@ -803,14 +803,8 @@ class SyncStorageAuthenticationPolicy(TokenServerAuthenticationPolicy):
         return user
 
 
-def run_live_functional_tests(TestCaseClass, argv=None):
-    """Execute the given suite of testcases against a live server."""
-    if argv is None:
-        argv = sys.argv
-
-    # This will only work using a StorageFunctionalTestCase subclass,
-    # since we override the _authenticate() method.
-    assert issubclass(TestCaseClass, StorageFunctionalTestCase)
+def parse_test_args(argv):
+    """Parse command line options."""
 
     usage = "Usage: %prog [options] <server-url>"
     parser = optparse.OptionParser(usage=usage)
@@ -840,13 +834,25 @@ def run_live_functional_tests(TestCaseClass, argv=None):
         help="assertion audience to use for tokenserver tests",
     )
 
-    try:
-        opts, args = parser.parse_args(argv)
-    except SystemExit as e:
-        return e.args[0]
+    opts, args = parser.parse_args(argv)
     if len(args) != 2:
         parser.print_usage()
-        return 2
+        sys.exit(2)
+
+    return opts, args
+
+
+def run_live_functional_tests(TestCaseClass, argv=None):
+    """Execute the given suite of testcases against a live server."""
+
+    # This will only work using a StorageFunctionalTestCase subclass,
+    # since we override the _authenticate() method.
+    assert issubclass(TestCaseClass, StorageFunctionalTestCase)
+
+    try:
+        opts, args = parse_test_args(argv or sys.argv)
+    except SystemExit as e:
+        return e.args[0]
 
     url = args[1]
     if opts.config_file is not None:

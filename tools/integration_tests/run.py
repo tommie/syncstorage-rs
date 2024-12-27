@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
 
+import errno
 import os.path
 import psutil
 import signal
 import subprocess
 import sys
+from urllib.error import URLError
+from urllib.parse import urljoin
+from urllib.request import urlopen
 from test_storage import TestStorage
-from test_support import run_live_functional_tests
+from test_support import parse_test_args, run_live_functional_tests
 import time
 from tokenserver.run import (run_end_to_end_tests, run_local_tests)
 
@@ -20,6 +24,17 @@ def terminate_process(process):
     for p in [proc] + child_proc:
         os.kill(p.pid, signal.SIGTERM)
     process.wait()
+
+
+def ping_http(url: str):
+    try:
+        resp = urlopen(url, timeout=1)
+        return resp.status // 100 == 2
+    except URLError as ex:
+        if (not isinstance(ex.reason, OSError) or
+                ex.reason.errno != errno.EADDRNOTAVAIL):
+            print(ex, file=sys.stderr)
+        return False
 
 
 if __name__ == "__main__":
@@ -37,13 +52,24 @@ if __name__ == "__main__":
         )
 
     def start_server():
+        opts, args = parse_test_args(sys.argv)
+
         the_server_subprocess = subprocess.Popen(
-            target_binary, shell=True, env=os.environ
+            [target_binary], env=os.environ
         )
 
-        # TODO we should change this to watch for a log message on startup
-        # to know when to continue instead of sleeping for a fixed amount
-        time.sleep(20)
+        heartbeat_url = urljoin(args[1], "/__heartbeat__")
+        while the_server_subprocess.poll() is None:
+            time.sleep(1)
+            if ping_http(heartbeat_url):
+                break
+
+        if the_server_subprocess.returncode is not None:
+            raise subprocess.CalledProcessError(
+                the_server_subprocess.returncode,
+                the_server_subprocess.args,
+                the_server_subprocess.stdout,
+                the_server_subprocess.stderr)
 
         return the_server_subprocess
 
