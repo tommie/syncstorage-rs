@@ -1,55 +1,97 @@
 # NOTE: Ensure builder's Rust version matches CI's in .circleci/config.yml
-FROM docker.io/lukemathwalker/cargo-chef:0.1.67-rust-1.78-bullseye as chef
+ARG debian_version=bookworm-slim
+ARG rust_image=docker.io/library/rust
+ARG rust_version=1.78-slim-bookworm
+FROM $rust_image:$rust_version AS buildbase
+
 WORKDIR /app
 
-FROM chef AS planner
+ENV CARGO_REGISTRIES_CRATES_IO_PROTOCOL=sparse
+
+ARG chef_version=0.1.67
+
+RUN cargo install cargo-chef --locked --version $chef_version
+
+# Either libmysqlclient-dev or libmariadb-dev.
+# libmysqlclient-dev is only available for AMD64 from repo.mysql.com.
+ARG MYSQLCLIENTPKG=libmariadb-dev
+
+# Fetch and load the MySQL public key.
+RUN \
+    if [ "$MYSQLCLIENTPKG" = libmysqlclient-dev ] ; then \
+       apt-get -q update && \
+       DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates wget && \
+       wget -q -O/etc/apt/trusted.gpg.d/mysql.asc https://repo.mysql.com/RPM-GPG-KEY-mysql-2023 && \
+       echo "deb https://repo.mysql.com/apt/debian/ bookworm mysql-8.0" >> /etc/apt/sources.list && \
+       rm -rf /var/lib/apt/lists/* ; \
+    fi
+
+# build-essential and cmake are required to build grpcio-sys for Spanner builds
+# libssl-dev is required by the openssl-sys crate, used for libmysqlclient-dev.
+RUN \
+    apt-get -q update && \
+    DEBIAN_FRONTEND=noninteractive apt-get -q install -y --no-install-recommends build-essential cmake dpkg-dev $MYSQLCLIENTPKG libssl-dev pkg-config python3-dev python3-pip && \
+    rm -rf /var/lib/apt/lists/*
+
+
+FROM buildbase AS planner
 COPY . .
 RUN cargo chef prepare --recipe-path recipe.json
 
-FROM chef AS cacher
-ARG DATABASE_BACKEND=spanner
 
-# cmake is required to build grpcio-sys for Spanner builds
-RUN \
-    # Fetch and load the MySQL public key. We need to install libmysqlclient-dev to build syncstorage-rs
-    # which wants the mariadb
-    wget -qO- https://repo.mysql.com/RPM-GPG-KEY-mysql-2023 > /etc/apt/trusted.gpg.d/mysql.asc && \
-    echo "deb https://repo.mysql.com/apt/debian/ bullseye mysql-8.0" >> /etc/apt/sources.list && \
-    apt-get -q update && \
-    apt-get -q install -y --no-install-recommends libmysqlclient-dev cmake
+FROM buildbase AS builder
+
+ARG rust_image=
+
+# If using a nightly Rust, allow recompiling the standard library.
+RUN if [ "$rust_image" = docker.io/rustlang/rust ] ; then rustup component add rust-src ; fi
+
+ARG DATABASE_BACKEND=spanner
+ARG CARGO_ARGS=
 
 COPY --from=planner /app/recipe.json recipe.json
-RUN cargo chef cook --release --no-default-features --features=syncstorage-db/$DATABASE_BACKEND --features=py_verifier --recipe-path recipe.json
+RUN cargo chef cook --locked --no-default-features --features=syncstorage-db/$DATABASE_BACKEND --features=py_verifier $CARGO_ARGS --recipe-path recipe.json
 
-FROM chef as builder
-ARG DATABASE_BACKEND=spanner
-
-COPY . /app
-COPY --from=cacher /app/target /app/target
-COPY --from=cacher $CARGO_HOME /app/$CARGO_HOME
-
-RUN \
-    # Fetch and load the MySQL public key
-    wget -qO- https://repo.mysql.com/RPM-GPG-KEY-mysql-2023 > /etc/apt/trusted.gpg.d/mysql.asc && \
-    echo "deb https://repo.mysql.com/apt/debian/ bullseye mysql-8.0" >> /etc/apt/sources.list && \
-    # mysql_pubkey.asc from:
-    # https://dev.mysql.com/doc/refman/8.0/en/checking-gpg-signature.html
-    # related:
-    # https://dev.mysql.com/doc/mysql-apt-repo-quick-guide/en/#repo-qg-apt-repo-manual-setup
-    apt-get -q update && \
-    apt-get -q install -y --no-install-recommends libmysqlclient-dev cmake golang-go python3-dev python3-pip python3-setuptools python3-wheel && \
-    pip3 install -r requirements.txt && \
-    rm -rf /var/lib/apt/lists/*
-
-ENV PATH=$PATH:/root/.cargo/bin
+COPY . .
 
 RUN \
     cargo --version && \
     rustc --version && \
-    cargo install --path ./syncserver --no-default-features --features=syncstorage-db/$DATABASE_BACKEND --features=py_verifier --locked --root /app && \
-    if [ "$DATABASE_BACKEND" = "spanner" ] ; then cargo install --path ./syncstorage-spanner --locked --root /app --bin purge_ttl ; fi
+    mkdir -p bin && \
+    cargo build --workspace --no-default-features --features=syncstorage-db/$DATABASE_BACKEND --features=py_verifier $CARGO_ARGS --locked --bin syncserver && \
+    cp -p target/*/syncserver bin/ && \
+    if [ "$DATABASE_BACKEND" = "spanner" ] ; then \
+       cargo build --workspace --locked --bin purge_ttl && \
+       cp -p target/*/purge_ttl bin/ ; \
+    fi
 
-FROM docker.io/library/debian:bullseye-slim
+# Creates a file called shlibdeps containing names of packages of shared libraries.
+#
+# dpkg-shlibdeps outputs
+#
+#   shlibs:Depends=libc6 (>= 2.36), libgcc-s1 (>= 4.2)
+#
+# and we reduce that to just an apt-get command line.
+RUN \
+    mkdir -p debian && \
+    touch debian/control && \
+    dpkg-shlibdeps -O bin/* | sed -E -e 's;shlibs:Depends=|\([^)]*\)|,\s*; ;g' >shlibdeps && \
+    echo shlibdeps: $(cat shlibdeps) && \
+    rm -r debian
+
+
+FROM buildbase AS python_builder
+
+COPY requirements.txt .
+COPY tools/integration_tests tools/integration_tests
+COPY tools/tokenserver tools/tokenserver
+
+RUN \
+    mkdir -p wheels && \
+    pip3 wheel --wheel-dir wheels -r requirements.txt -r /app/tools/integration_tests/requirements.txt -r /app/tools/tokenserver/requirements.txt
+
+
+FROM docker.io/library/debian:$debian_version
 WORKDIR /app
 COPY --from=builder /app/requirements.txt /app
 # Due to a build error that occurs with the Python cryptography package, we
@@ -59,31 +101,35 @@ COPY --from=builder /app/requirements.txt /app
 ENV CRYPTOGRAPHY_DONT_BUILD_RUST=1
 
 RUN \
-    apt-get -q update && apt-get -qy install wget
-
-
-RUN \
     groupadd --gid 10001 app && \
-    useradd --uid 10001 --gid 10001 --home /app --create-home app && \
-    # first, an apt-get update is required for gnupg, which is required for apt-key adv
+    useradd --uid 10001 --gid 10001 --home /app --no-create-home app
+
+COPY --from=builder /app/shlibdeps /app/
+
+# Fetch and load the MySQL public key.
+RUN \
+    if grep -q libmysqlclient shlibdeps ; then \
+       apt-get -q update && \
+       DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates wget && \
+       wget -q -O/etc/apt/trusted.gpg.d/mysql.asc https://repo.mysql.com/RPM-GPG-KEY-mysql-2023 && \
+       echo "deb https://repo.mysql.com/apt/debian/ bookworm mysql-8.0" >> /etc/apt/sources.list && \
+       rm -rf /var/lib/apt/lists/* ; \
+    fi
+
+# curl is used by scripts/prepare-spanner.sh and health checks
+# jq is used by scripts/prepare-spanner.sh.
+RUN \
     apt-get -q update && \
-    # and ca-certificates needed for https://repo.mysql.com
-    apt-get install -y gnupg ca-certificates wget && \
-    # Fetch and load the MySQL public key
-    echo "deb https://repo.mysql.com/apt/debian/ bullseye mysql-8.0" >> /etc/apt/sources.list && \
-    wget -qO- https://repo.mysql.com/RPM-GPG-KEY-mysql-2023 > /etc/apt/trusted.gpg.d/mysql.asc && \
-    # update again now that we trust repo.mysql.com
-    apt-get -q update && \
-    apt-get -q install -y build-essential libmysqlclient-dev libssl-dev libffi-dev libcurl4 python3-dev python3-pip python3-setuptools python3-wheel cargo curl jq && \
-    # The python3-cryptography debian package installs version 2.6.1, but we
-    # we want to use the version specified in requirements.txt. To do this,
-    # we have to remove the python3-cryptography package here.
-    apt-get -q remove -y python3-cryptography && \
-    pip3 install -r /app/requirements.txt && \
+    DEBIAN_FRONTEND=noninteractive apt-get -q install -y --no-install-recommends $APT_INSTALL_ARGS $(cat shlibdeps) python3-pip curl jq && \
     rm -rf /var/lib/apt/lists/*
 
+COPY --from=python_builder /app/wheels /app/wheels
+
+RUN pip3 install --no-index --no-deps --break-system-packages /app/wheels/*.whl && \
+    rm -r /app/wheels
+
 COPY --from=builder /app/bin /app/bin
-COPY --from=builder /app/syncserver/version.json /app
+COPY --from=builder /app/syncserver/version.json /app/
 COPY --from=builder /app/tools/spanner /app/tools/spanner
 COPY --from=builder /app/tools/integration_tests /app/tools/integration_tests
 COPY --from=builder /app/tools/tokenserver /app/tools/tokenserver
@@ -92,8 +138,6 @@ COPY --from=builder /app/scripts/start_mock_fxa_server.sh /app/scripts/start_moc
 COPY --from=builder /app/syncstorage-spanner/src/schema.ddl /app/schema.ddl
 
 RUN chmod +x /app/scripts/prepare-spanner.sh
-RUN pip3 install -r /app/tools/integration_tests/requirements.txt
-RUN pip3 install -r /app/tools/tokenserver/requirements.txt
 
 USER app:app
 
